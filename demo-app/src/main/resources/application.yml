@@ -1,0 +1,20 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: jfr-endpoint-profiler-demo
+
+profiler:
+  enabled: true
+  sample-period: 10ms
+  sample-retention: 5s
+  latency-window-size: 5000
+  hot-methods-per-endpoint: 10
+  exclude-paths:
+    - /profiler/**
+    - /actuator/**
+
+logging:
+  level:
+    dev.shashank.profiler: INFO

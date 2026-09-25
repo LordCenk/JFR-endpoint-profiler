@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>JFR Endpoint Profiler</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/d3-flame-graph@4/dist/d3-flamegraph.css">
+<style>
+  :root {
+    --bg: #0f1117;
+    --panel: #171a23;
+    --border: #2a2e3a;
+    --text: #e6e8ee;
+    --muted: #9aa1b1;
+    --accent: #5b8def;
+    --danger: #e5534b;
+    --row-hover: #1f2330;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    padding: 18px 24px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+  }
+  header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  header .subtitle { color: var(--muted); font-size: 13px; }
+  main { padding: 20px 24px; display: grid; gap: 20px; grid-template-columns: minmax(420px, 1fr) 2fr; align-items: start; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .panel h2 {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    margin: 0;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 8px 12px; text-align: right; white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 500; cursor: pointer; user-select: none; }
+  tbody tr { cursor: pointer; border-top: 1px solid var(--border); }
+  tbody tr:hover { background: var(--row-hover); }
+  tbody tr.selected { background: #1c2540; }
+  .method { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 11px; font-weight: 600; background: #24304d; color: var(--accent); }
+  .p95 { color: var(--danger); font-weight: 600; }
+  #flamegraph { min-height: 420px; padding: 12px 16px; }
+  #hotmethods { padding: 4px 16px 12px; }
+  #hotmethods table { font-size: 12px; }
+  .empty { padding: 24px 16px; color: var(--muted); font-size: 13px; }
+  .refresh-hint { color: var(--muted); font-size: 12px; margin-left: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>JFR Endpoint Profiler</h1>
+  <span class="subtitle">endpoints ranked by p95 latency &middot; click a row for its flame graph</span>
+  <span class="refresh-hint" id="refresh-hint">auto-refreshing every 5s</span>
+</header>
+<main>
+  <section class="panel">
+    <h2>Endpoints</h2>
+    <div id="endpoints-container">
+      <div class="empty">No requests profiled yet. Send some traffic and this table will populate.</div>
+    </div>
+  </section>
+  <section class="panel">
+    <h2 id="detail-heading">Flame graph</h2>
+    <div id="flamegraph"><div class="empty">Select an endpoint on the left to see its call tree.</div></div>
+    <div id="hotmethods"></div>
+  </section>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/d3-flame-graph@4/dist/d3-flamegraph.min.js"></script>
+<script>
+(function () {
+  const API_BASE = '/profiler/api';
+  let selectedKey = null;
+  let flameChart = null;
+  let sortKey = 'p95Millis';
+  let sortDesc = true;
+  let lastEndpoints = [];
+
+  function keyOf(row) {
+    return row.httpMethod + ' ' + row.pathPattern;
+  }
+
+  function fmtMs(v) {
+    return (v === null || v === undefined) ? '-' : v.toString();
+  }
+
+  function renderEndpoints(rows) {
+    const container = document.getElementById('endpoints-container');
+    if (!rows.length) {
+      container.innerHTML = '<div class="empty">No requests profiled yet. Send some traffic and this table will populate.</div>';
+      return;
+    }
+    const sorted = [...rows].sort((a, b) => {
+      const diff = (a[sortKey] ?? 0) - (b[sortKey] ?? 0);
+      return sortDesc ? -diff : diff;
+    });
+
+    const cols = [
+      ['httpMethod', 'Method'], ['pathPattern', 'Path'], ['count', 'Count'],
+      ['errorCount', 'Errs'], ['p50Millis', 'p50'], ['p95Millis', 'p95'],
+      ['p99Millis', 'p99'], ['maxMillis', 'max'], ['samplesCorrelated', 'Samples']
+    ];
+
+    let html = '<table><thead><tr>' + cols.map(([k, label]) =>
+      `<th data-key="${k}">${label}${sortKey === k ? (sortDesc ? ' ▼' : ' ▲') : ''}</th>`
+    ).join('') + '</tr></thead><tbody>';
+
+    for (const row of sorted) {
+      const k = keyOf(row);
+      const selectedClass = k === selectedKey ? ' selected' : '';
+      html += `<tr class="row${selectedClass}" data-method="${row.httpMethod}" data-pattern="${encodeURIComponent(row.pathPattern)}">` +
+        `<td><span class="method">${row.httpMethod}</span> ${row.pathPattern}</td>` +
+        `<td>${row.count}</td>` +
+        `<td>${row.errorCount}</td>` +
+        `<td>${fmtMs(row.p50Millis)}</td>` +
+        `<td class="p95">${fmtMs(row.p95Millis)}</td>` +
+        `<td>${fmtMs(row.p99Millis)}</td>` +
+        `<td>${fmtMs(row.maxMillis)}</td>` +
+        `<td>${row.samplesCorrelated}</td>` +
+        `</tr>`;
+    }
+    html += '</tbody></table>';
+    container.innerHTML = html;
+
+    container.querySelectorAll('th[data-key]').forEach(th => {
+      th.addEventListener('click', () => {
+        const k = th.getAttribute('data-key');
+        if (sortKey === k) { sortDesc = !sortDesc; } else { sortKey = k; sortDesc = true; }
+        renderEndpoints(lastEndpoints);
+      });
+    });
+    container.querySelectorAll('tr.row').forEach(tr => {
+      tr.addEventListener('click', () => {
+        const method = tr.getAttribute('data-method');
+        const pattern = decodeURIComponent(tr.getAttribute('data-pattern'));
+        selectEndpoint(method, pattern);
+      });
+    });
+  }
+
+  function selectEndpoint(method, pattern) {
+    selectedKey = method + ' ' + pattern;
+    document.getElementById('detail-heading').textContent = 'Flame graph — ' + method + ' ' + pattern;
+    renderEndpoints(lastEndpoints);
+    loadFlameGraph(method, pattern);
+    loadHotMethods(method, pattern);
+  }
+
+  function loadFlameGraph(method, pattern) {
+    const url = `${API_BASE}/endpoints/flamegraph?method=${encodeURIComponent(method)}&pattern=${encodeURIComponent(pattern)}`;
+    fetch(url).then(r => r.ok ? r.json() : Promise.reject(r.status)).then(data => {
+      const el = document.getElementById('flamegraph');
+      el.innerHTML = '';
+      flameChart = flamegraph()
+        .width(Math.max(el.clientWidth, 400))
+        .cellHeight(20)
+        .transitionDuration(300)
+        .minFrameSize(1)
+        .title('')
+        .label(d => d.data.name + ' (' + d.data.value + ' samples)');
+      d3.select('#flamegraph').datum(data).call(flameChart);
+    }).catch(() => {
+      document.getElementById('flamegraph').innerHTML = '<div class="empty">No samples correlated yet for this endpoint.</div>';
+    });
+  }
+
+  function loadHotMethods(method, pattern) {
+    const url = `${API_BASE}/endpoints/hotmethods?method=${encodeURIComponent(method)}&pattern=${encodeURIComponent(pattern)}`;
+    fetch(url).then(r => r.ok ? r.json() : Promise.reject(r.status)).then(rows => {
+      const el = document.getElementById('hotmethods');
+      if (!rows.length) { el.innerHTML = ''; return; }
+      let html = '<table><thead><tr><th>Method</th><th>Self %</th><th>Self count</th></tr></thead><tbody>';
+      for (const row of rows) {
+        html += `<tr><td>${row.className}.${row.methodName}${row.line >= 0 ? ':' + row.line : ''}</td>` +
+          `<td>${row.percentOfTotal}%</td><td>${row.selfCount}</td></tr>`;
+      }
+      html += '</tbody></table>';
+      el.innerHTML = html;
+    }).catch(() => { document.getElementById('hotmethods').innerHTML = ''; });
+  }
+
+  function refresh() {
+    fetch(API_BASE + '/endpoints').then(r => r.json()).then(rows => {
+      lastEndpoints = rows;
+      renderEndpoints(rows);
+      if (selectedKey) {
+        const [method, ...rest] = selectedKey.split(' ');
+        const pattern = rest.join(' ');
+        loadFlameGraph(method, pattern);
+        loadHotMethods(method, pattern);
+      }
+    }).catch(() => {});
+  }
+
+  refresh();
+  setInterval(refresh, 5000);
+})();
+</script>
+</body>
+</html>
